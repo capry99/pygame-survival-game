@@ -1,0 +1,2157 @@
+
+
+# ===== FILE: character.py =====
+
+import os
+import math
+import pygame
+import constants
+from constants import *
+from inventory import Inventory
+from typing import Optional
+
+
+class Character:
+    def __init__(self, x: int, y: int):
+        self.x = x
+        self.y = y
+        self.inventory = Inventory()
+
+        image_path = os.path.join("assets", "images", "character", "Player.png")
+        try:
+            self.sprite_sheet = pygame.image.load(image_path).convert_alpha()
+        except Exception:
+            self.sprite_sheet = pygame.Surface((FRAME_SIZE * CUADROS_BASICOS, FRAME_SIZE * 6), pygame.SRCALPHA)
+
+        action_path = os.path.join("assets", "images", "character", "Player_Actions.png")
+        try:
+            self.action_sprite_sheet = pygame.image.load(action_path).convert_alpha()
+        except Exception:
+            self.action_sprite_sheet = pygame.Surface((FRAME_SIZE * 2, FRAME_SIZE * 12), pygame.SRCALPHA)
+
+        self.frame_size      = FRAME_SIZE
+        self.animation_frame = 0
+        self.animation_timer = 0
+        self.current_state   = IDLE_DOWN
+        self.moving          = False
+        self.facing_left     = False
+        self.is_running      = False
+
+        # Herramientas
+        self.is_chopping  = False
+        self.chop_timer   = 0
+        self.chop_frame   = 0
+        self._chop_cycles = 0
+
+        self.is_hoeing   = False
+        self.hoe_frame   = 0
+        self.hoe_timer   = 0
+        self._hoe_cycles = 0
+
+        self._action_target             = None
+        self._action_type: Optional[str] = None
+
+        # Estados
+        self.energy  = constants.MAX_ENERGY
+        self.food    = constants.MAX_FOOD
+        self.thirst  = constants.MAX_THIRST
+        self.stamina = constants.MAX_STAMINA
+
+        self.width  = constants.PLAYER
+        self.height = constants.PLAYER
+        self.rect   = pygame.Rect(self.x, self.y, self.width, self.height)
+
+        self.animations     = self.load_animation()
+        self.axe_animations = self.load_axe_animations()
+        self.hoe_animations = self.load_hoe_animations()
+
+        self._world = None
+        self._last_farm_tile  = None   # evita re-sembrar/cosechar cada frame
+        self.hoe_preview_tile = None   # (tx,ty) del tile preview mientras P está apretado
+
+    # ── Sprites ───────────────────────────────────────────────────────────────
+    def load_animation(self):
+        anims = {}
+        for state in range(6):
+            frames = []
+            for frame in range(CUADROS_BASICOS):
+                surf = pygame.Surface((self.frame_size, self.frame_size), pygame.SRCALPHA)
+                surf.blit(self.sprite_sheet, (0, 0),
+                          (frame * self.frame_size, state * self.frame_size,
+                           self.frame_size, self.frame_size))
+                frames.append(pygame.transform.scale(surf, (self.width, self.height)))
+            anims[state] = frames
+        return anims
+
+    def _load_tool_animation(self, row_mapping, total_cols):
+        anims = {}
+        fw = max(1, self.action_sprite_sheet.get_width()  // total_cols)
+        fh = max(1, self.action_sprite_sheet.get_height() // 12)
+        for state, row in row_mapping.items():
+            frames = []
+            for col in range(total_cols):
+                src  = pygame.Rect(col * fw, row * fh, fw, fh)
+                tmp  = pygame.Surface((fw, fh), pygame.SRCALPHA)
+                tmp.blit(self.action_sprite_sheet, (0, 0), src)
+                norm = pygame.Surface((self.frame_size, self.frame_size), pygame.SRCALPHA)
+                norm.blit(tmp, ((self.frame_size - fw) // 2, (self.frame_size - fh) // 2))
+                frames.append(pygame.transform.scale(norm, (self.width, self.height)))
+            anims[state] = frames
+        return anims
+
+    def load_axe_animations(self):
+        return self._load_tool_animation({IDLE_RIGHT: 3, IDLE_DOWN: 4, IDLE_UP: 5}, AXE_COLS)
+
+    def load_hoe_animations(self):
+        return self._load_tool_animation({IDLE_RIGHT: 6, IDLE_DOWN: 7, IDLE_UP: 8}, HOE_COLS)
+
+    # ── Animación ─────────────────────────────────────────────────────────────
+    def update_animation(self, dt):
+        now = pygame.time.get_ticks()
+
+        if self.is_chopping:
+            if now - self.chop_timer > AXE_ANIMATION_DELAY:
+                self.chop_timer  = now
+                self.chop_frame += 1
+                if self.chop_frame >= AXE_FRAMES:
+                    self.chop_frame    = 0
+                    self._chop_cycles += 1
+                    if self._action_target is not None:
+                        self._execute_action('chop')
+                    if self._action_target is None:
+                        self.is_chopping  = False
+                        self._action_type = None
+                        self._chop_cycles = 0
+
+        elif self.is_hoeing:
+            if now - self.hoe_timer > HOE_ANIMATION_DELAY:
+                self.hoe_timer  = now
+                self.hoe_frame += 1
+                if self.hoe_frame >= HOE_FRAMES:
+                    self.hoe_frame    = 0
+                    self._hoe_cycles += 1
+                    if self._action_target is not None:
+                        self._execute_action('hoe')
+                    self.is_hoeing    = False
+                    self._action_type = None
+                    self._hoe_cycles  = 0
+                    self._action_target = None
+
+        else:
+            speed = RUNNING_ANIMATION_DELAY if self.is_running else ANIMATION_DELAY
+            if now - self.animation_timer > speed:
+                self.animation_timer  = now
+                self.animation_frame  = (self.animation_frame + 1) % CUADROS_BASICOS
+
+    # ── Dibujo ────────────────────────────────────────────────────────────────
+    def _get_tool_frame(self, anim_dict, frame_idx, frames_count):
+        safe = frame_idx % frames_count
+        st   = self.current_state
+        if st in (IDLE_RIGHT, WALK_RIGHT):
+            f = anim_dict[IDLE_RIGHT][safe]
+            return pygame.transform.flip(f, True, False) if self.facing_left else f
+        elif st in (IDLE_UP, WALK_UP):
+            return anim_dict[IDLE_UP][safe]
+        else:
+            return anim_dict[IDLE_DOWN][safe]
+
+    def draw(self, screen, camera_x, camera_y, world=None):
+        sx = self.x - camera_x
+        sy = self.y - camera_y
+
+        if self.is_chopping:
+            frame = self._get_tool_frame(self.axe_animations, self.chop_frame, AXE_FRAMES)
+        elif self.is_hoeing:
+            frame = self._get_tool_frame(self.hoe_animations, self.hoe_frame, HOE_FRAMES)
+        else:
+            frame = self.animations[self.current_state][self.animation_frame]
+            if self.facing_left:
+                frame = pygame.transform.flip(frame, True, False)
+
+        screen.blit(frame, (sx, sy))
+        self.draw_status_bars(screen, world)
+
+    # ── Movimiento ────────────────────────────────────────────────────────────
+    def is_in_water(self, world) -> bool:
+        if world is None:
+            return False
+        # Comprobar el centro del personaje
+        cx = self.x + self.width  // 2
+        cy = self.y + self.height // 2
+        return world.is_water_at(cx, cy)
+
+    def move(self, dx: float, dy: float, world):
+        old_x, old_y = self.x, self.y
+        speed = RUN_SPEED if self.is_running and self.stamina > 0 else WALK_SPEED
+
+        # FIX recolección izquierda: multiplicar siempre antes de aplicar
+        dx *= speed / WALK_SPEED
+        dy *= speed / WALK_SPEED
+
+        # Reducir velocidad en agua
+        if self.is_in_water(world):
+            dx *= constants.WATER_MOVEMENT_MULTIPLIER
+            dy *= constants.WATER_MOVEMENT_MULTIPLIER
+
+        def _collides():
+            for chunk in world.active_chunks.values():
+                for obj in chunk.trees + chunk.small_stones:
+                    if self.rect.colliderect(obj.rect):
+                        return True
+            return False
+
+        self.x += dx
+        self.rect.topleft = (self.x, self.y)
+        if _collides():
+            self.x = old_x
+            self.rect.topleft = (self.x, self.y)
+
+        self.y += dy
+        self.rect.topleft = (self.x, self.y)
+        if _collides():
+            self.y = old_y
+            self.rect.topleft = (self.x, self.y)
+
+        if dx != 0 or dy != 0:
+            self.moving = True
+            if   dx < 0: self.current_state = WALK_RIGHT; self.facing_left = True
+            elif dx > 0: self.current_state = WALK_RIGHT; self.facing_left = False
+            elif dy < 0: self.current_state = WALK_UP;    self.facing_left = False
+            elif dy > 0: self.current_state = WALK_DOWN;  self.facing_left = False
+        else:
+            self.moving = False
+            if   self.current_state in (WALK_DOWN,  IDLE_DOWN):  self.current_state = IDLE_DOWN
+            elif self.current_state in (WALK_UP,    IDLE_UP):    self.current_state = IDLE_UP
+            elif self.current_state in (WALK_RIGHT, IDLE_RIGHT): self.current_state = IDLE_RIGHT
+
+        if self.moving:
+            if self.is_running and self.stamina > 0:
+                self.update_stamina(-constants.STAMINA_DECREASE_RATE)
+                self.update_energy(-MOVEMENT_ENERGY_COST * 2)
+            else:
+                self.update_energy(-MOVEMENT_ENERGY_COST)
+                self.update_stamina(STAMINA_INCREASE_RATE)
+
+    # ── Interacciones ─────────────────────────────────────────────────────────
+    def is_near(self, obj, radius: int = 100) -> bool:
+        """
+        Compara el centro del personaje con el centro del objeto.
+        Usa obj.rect si existe (más preciso), si no usa obj.x/y + size/2.
+        Radio 100 cubre el personaje de 100px en cualquier dirección.
+        """
+        cx = self.x + self.width  // 2
+        cy = self.y + self.height // 2
+        if hasattr(obj, 'rect'):
+            ox = obj.rect.centerx
+            oy = obj.rect.centery
+        elif hasattr(obj, 'size'):
+            ox = obj.x + obj.size // 2
+            oy = obj.y + obj.size // 2
+        else:
+            ox, oy = obj.x, obj.y
+        return abs(cx - ox) <= radius and abs(cy - oy) <= radius
+
+    def _target_tile(self):
+        """Tile frente al personaje según su dirección."""
+        step = constants.GRASS_SIZE
+        cx   = self.x + self.width  // 2
+        cy   = self.y + self.height // 2
+        if self.current_state in (WALK_UP, IDLE_UP):
+            tx, ty = cx, cy - self.height
+        elif self.current_state in (WALK_DOWN, IDLE_DOWN):
+            tx, ty = cx, cy + step
+        elif self.current_state in (WALK_RIGHT, IDLE_RIGHT):
+            tx = (cx - self.width - step) if self.facing_left else (cx + self.width // 2)
+            ty = cy
+        else:
+            tx, ty = cx, cy + step
+        # Alinear a la grilla
+        return (tx // step) * step, (ty // step) * step
+
+    def update_hoe_preview(self, p_held: bool):
+        """
+        Llama cada frame con p_held=True si la tecla P está apretada.
+        Actualiza hoe_preview_tile para mostrar dónde irá el farmland.
+        Si la pala no está equipada o P no está apretada, limpia el preview.
+        """
+        if p_held and self.inventory.has_hoe_equipped():
+            self.hoe_preview_tile = self._target_tile()
+        else:
+            self.hoe_preview_tile = None
+
+    def start_hoe(self, world):
+        if self.is_hoeing:
+            return
+        self.is_hoeing     = True
+        self.hoe_timer     = pygame.time.get_ticks()
+        self.hoe_frame     = 0
+        self._hoe_cycles   = 0
+        self._action_target = self._target_tile()
+        self._action_type  = 'hoe'
+
+    def start_chop(self, world):
+        if self.is_chopping:
+            return
+        for chunk in world.active_chunks.values():
+            for tree in chunk.trees:
+                if self.is_near(tree):
+                    self.is_chopping   = True
+                    self.chop_timer    = pygame.time.get_ticks()
+                    self.chop_frame    = 0
+                    self._chop_cycles  = 0
+                    self._action_target = tree
+                    self._action_type  = 'chop'
+                    return
+
+    def interact(self, world):
+        """ESPACIO: recolectar árboles y piedras."""
+        # Beber agua (E)
+        if self.is_in_water(world):
+            self.update_thirst(constants.WATER_THIRST_RECOVERY)
+            print(f"[interact] Bebiste agua. Sed: {int(self.thirst)}")
+            return
+
+        # Árboles
+        for chunk in world.active_chunks.values():
+            for tree in chunk.trees:
+                if self.is_near(tree):
+                    has_axe = self.inventory.has_axe_equipped()
+                    if has_axe and not self.is_chopping:
+                        self.is_chopping    = True
+                        self.chop_timer     = pygame.time.get_ticks()
+                        self.chop_frame     = 0
+                        self._chop_cycles   = 0
+                        self._action_target = tree
+                        self._action_type   = 'chop'
+                    elif not has_axe:
+                        self._action_target = tree
+                        self._execute_action('chop')
+                    return
+
+        # Piedras
+        for chunk in world.active_chunks.values():
+            for stone in chunk.small_stones:
+                if self.is_near(stone):
+                    self._action_target = stone
+                    self._execute_action('mine')
+                    return
+
+    def _execute_action(self, action_kind: str):
+        target = self._action_target
+        if target is None:
+            return
+        world = self._world
+        if world is None:
+            print("[_execute_action] ERROR: _world no seteado")
+            return
+
+        if action_kind == 'chop' and hasattr(target, 'chop'):
+            result = target.chop(with_axe=self.inventory.has_axe_equipped())
+            if result in ("chopped", "destroyed"):
+                self.inventory.add_item("wood", 1)
+                print(f"[chop] +1 madera (total {self.inventory.get_quantity('wood')})")
+            if result == "destroyed":
+                for chunk in world.active_chunks.values():
+                    if target in chunk.trees:
+                        chunk.trees.remove(target)
+                        break
+                self._action_target = None
+
+        elif action_kind == 'mine' and hasattr(target, 'mine'):
+            if target.mine():
+                self.inventory.add_item("stone", 1)
+                print(f"[mine] +1 piedra (total {self.inventory.get_quantity('stone')})")
+            if getattr(target, 'stone', 0) == 0:
+                for chunk in world.active_chunks.values():
+                    if target in chunk.small_stones:
+                        chunk.small_stones.remove(target)
+                        break
+                self._action_target = None
+
+        elif action_kind == 'hoe' and isinstance(target, tuple):
+            world.add_farmland(target[0], target[1])
+            self._action_target = None
+
+    # ── HUD ───────────────────────────────────────────────────────────────────
+    def draw_inventory(self, screen, show_inventory=False):
+        self.inventory.draw(screen, show_inventory)
+        if show_inventory:
+            font = pygame.font.Font(None, 22)
+            txt  = font.render("I: cerrar inventario", True, constants.WHITE)
+            screen.blit(txt, (constants.WIDTH // 2 - txt.get_width() // 2, constants.HEIGHT - 36))
+
+    def update_energy(self, a):  self.energy  = max(0, min(MAX_ENERGY,  self.energy  + a))
+    def update_food(self, a):    self.food    = max(0, min(MAX_FOOD,    self.food    + a))
+    def update_thirst(self, a):  self.thirst  = max(0, min(MAX_THIRST,  self.thirst  + a))
+    def update_stamina(self, a): self.stamina = max(0, min(MAX_STAMINA, self.stamina + a))
+
+    def draw_status_bars(self, screen, world=None):
+        bw, bh, sp = 100, 10, 10
+        x, y = 10, 10
+        font = pygame.font.SysFont(None, 20)
+
+        in_water = self.is_in_water(world)
+
+        for label, val, maxval, color in [
+            ("Energía", self.energy,  MAX_ENERGY,  constants.ENERGY_COLOR),
+            ("Comida",  self.food,    MAX_FOOD,    constants.FOOD_COLOR),
+            ("Sed",     self.thirst,  MAX_THIRST,  constants.THIRST_COLOR),
+            ("Stamina", self.stamina, MAX_STAMINA, constants.STAMINA_COLOR),
+        ]:
+            pygame.draw.rect(screen, constants.BAR_BACKGROUND_COLOR, (x, y, bw, bh))
+            pygame.draw.rect(screen, color, (x, y, int(bw * val / maxval), bh))
+            screen.blit(font.render(f"{label}: {int(val)}", True, constants.WHITE), (x + bw + 5, y))
+            y += bh + sp
+
+        if world is not None:
+            tod = (world.current_time / constants.DAY_LENGTH) * 24
+            screen.blit(font.render(f"Hora: {int(tod):02d}:00", True, constants.WHITE), (x, y))
+            y += bh + sp
+
+        # Indicador agua
+        if in_water:
+            screen.blit(font.render("En agua — E: beber", True, (100, 200, 255)), (x, y))
+
+    def update_status(self, world=None, dt_seconds: float = 1.0):
+        fr = constants.FOOD_DECREASE_RATE   * (RUN_FOOD_DECREASE_MULTIPLIER   if self.is_running else 1)
+        tr = constants.THIRST_DECREASE_RATE * (RUN_THIRST_DECREASE_MULTIPLIER if self.is_running else 1)
+        self.update_food(-fr * dt_seconds)
+        self.update_thirst(-tr * dt_seconds)
+        if self.food < MAX_FOOD * 0.2 or self.thirst < MAX_THIRST * 0.2:
+            self.update_energy(-constants.ENERGY_DECREASE_RATE * dt_seconds)
+        else:
+            self.update_energy(constants.ENERGY_INCREASE_RATE * dt_seconds)
+        if self.is_running and self.stamina > 0:
+            self.update_stamina(-constants.STAMINA_DECREASE_RATE * dt_seconds)
+        else:
+            self.update_stamina(constants.STAMINA_INCREASE_RATE * dt_seconds)
+
+    # ── Proximidad (FIX: usa centro del personaje, no esquina) ────────────────
+    def water_farmland(self, world) -> bool:
+        """
+        Tecla E cerca de un farmland: riega manualmente ese tile.
+        Si hay agua cerca (lago adyacente) bebe; si hay farmland cerca riega.
+        """
+        # Primero, beber si está en agua
+        if self.is_in_water(world):
+            self.update_thirst(constants.WATER_THIRST_RECOVERY)
+            print(f"[drink] +{constants.WATER_THIRST_RECOVERY} sed")
+            return True
+
+        # Regar farmland más cercano dentro de 1 tile de distancia
+        step = constants.GRASS_SIZE
+        cx   = self.x + self.width  // 2
+        cy   = self.y + self.height // 2
+        for dx in (-step, 0, step):
+            for dy in (-step, 0, step):
+                farm = world.get_farmland_at(cx + dx, cy + dy)
+                if farm and farm.state in ("planted", "growing"):
+                    farm._manual_water_timer = constants.FARM_MANUAL_WATER_DURATION
+                    print(f"[water] farmland regado en ({farm.x},{farm.y})")
+                    return True
+        return False
+
+    def auto_farm_interact(self, world):
+        """
+        Se llama cada frame desde main.py.
+        Si el jugador está parado sobre un farmland:
+          - Si está vacío y tiene semillas en inventario → siembra
+          - Si está listo → cosecha
+        Usa _last_farm_tile para no repetir la acción cada frame.
+        """
+        # Tile bajo el centro del personaje
+        cx = self.x + self.width  // 2
+        cy = self.y + self.height // 2
+        farm = world.get_farmland_at(cx, cy)
+
+        # Si no hay farmland o es el mismo que el último frame → nada
+        current_key = (farm.x, farm.y) if farm else None
+        if current_key == self._last_farm_tile:
+            return
+        self._last_farm_tile = current_key
+
+        if farm is None:
+            return
+
+        # Cosechar 1 zanahoria al pararse encima
+        if farm.state == "ready":
+            count = farm.harvest_one()
+            if count > 0:
+                self.inventory.add_item(constants.ITEM_CARROT, count)
+                remaining = farm.seeds_count
+                print(f"[farm] +1 zanahoria cosechada (quedan {remaining} en el tile)")
+                # Resetear _last_farm_tile para que el siguiente paso cosecha otra
+                self._last_farm_tile = None
+            return
+
+        # Sembrar si está vacío y el jugador tiene semillas
+        if farm.state == "empty":
+            seed_qty = self.inventory.get_quantity(constants.ITEM_CARROT_SEED)
+            if seed_qty > 0:
+                used = farm.plant(seed_qty)
+                if used > 0:
+                    # Descontar semillas del inventario
+                    self._consume_item(constants.ITEM_CARROT_SEED, used)
+                    print(f"[farm] sembradas {used} semillas")
+
+    def _consume_item(self, item_name: str, quantity: int):
+        """Consume 'quantity' unidades de item_name del inventario/hotbar."""
+        remaining = quantity
+        # Hotbar primero
+        for slot in self.inventory.hotbar:
+            if slot and slot.name == item_name and remaining > 0:
+                take = min(slot.quantity, remaining)
+                slot.quantity -= take
+                remaining    -= take
+        # Inventario principal
+        for row in self.inventory.inventory:
+            for slot in row:
+                if slot and slot.name == item_name and remaining > 0:
+                    take = min(slot.quantity, remaining)
+                    slot.quantity -= take
+                    remaining    -= take
+        # Limpiar slots vacíos
+        for i, slot in enumerate(self.inventory.hotbar):
+            if slot and slot.quantity <= 0:
+                self.inventory.hotbar[i] = None
+        for r, row in enumerate(self.inventory.inventory):
+            for c, slot in enumerate(row):
+                if slot and slot.quantity <= 0:
+                    self.inventory.inventory[r][c] = None
+
+    def is_near(self, obj, radius: int = 90) -> bool:
+        """
+        FIX: compara usando el CENTRO del personaje vs el CENTRO del objeto.
+        Antes usaba self.x (esquina superior izquierda), por eso fallaba
+        cuando el jugador estaba a la derecha del objeto.
+        """
+        cx = self.x + self.width  // 2
+        cy = self.y + self.height // 2
+        ox = obj.x + (obj.size if hasattr(obj, 'size') else 32) // 2
+        oy = obj.y + (obj.size if hasattr(obj, 'size') else 32) // 2
+        return abs(cx - ox) <= radius and abs(cy - oy) <= radius
+
+    def is_in_water(self, world) -> bool:
+        cx = self.x + self.width  // 2
+        cy = self.y + self.height // 2
+        return world.is_water_at(cx, cy)
+
+    # ── Tile objetivo de la pala ──────────────────────────────────────────────
+    def _target_tile(self):
+        """
+        FIX: calcula el tile frente al personaje usando su CENTRO,
+        alineado a GRASS_SIZE.
+        """
+        tile = constants.GRASS_SIZE
+        cx = self.x + self.width  // 2
+        cy = self.y + self.height // 2
+
+        if self.current_state in (WALK_UP, IDLE_UP):
+            tx, ty = cx, cy - self.height // 2 - tile
+        elif self.current_state in (WALK_DOWN, IDLE_DOWN):
+            tx, ty = cx, cy + self.height // 2 + tile // 2
+        elif self.current_state in (WALK_RIGHT, IDLE_RIGHT):
+            if self.facing_left:
+                tx, ty = cx - self.width // 2 - tile, cy
+            else:
+                tx, ty = cx + self.width // 2 + tile // 2, cy
+        else:
+            tx, ty = cx, cy + self.height // 2 + tile // 2
+
+        tx = (int(tx) // tile) * tile
+        ty = (int(ty) // tile) * tile
+        return tx, ty
+
+    # ── Acciones ──────────────────────────────────────────────────────────────
+    def update_hoe_preview(self, p_held: bool):
+        """
+        Llama cada frame con p_held=True si la tecla P está apretada.
+        Actualiza hoe_preview_tile para mostrar dónde irá el farmland.
+        Si la pala no está equipada o P no está apretada, limpia el preview.
+        """
+        if p_held and self.inventory.has_hoe_equipped():
+            self.hoe_preview_tile = self._target_tile()
+        else:
+            self.hoe_preview_tile = None
+
+    def start_hoe(self, world):
+        if self.is_hoeing:
+            return
+        self.is_hoeing      = True
+        self.hoe_timer      = pygame.time.get_ticks()
+        self.hoe_frame      = 0
+        self._hoe_cycles    = 0
+        self._action_target = self._target_tile()
+        self._action_type   = 'hoe'
+
+    def start_chop(self, world):
+        if self.is_chopping:
+            return
+        for chunk in world.active_chunks.values():
+            for tree in chunk.trees:
+                if self.is_near(tree):
+                    self.is_chopping    = True
+                    self.chop_timer     = pygame.time.get_ticks()
+                    self.chop_frame     = 0
+                    self._chop_cycles   = 0
+                    self._action_target = tree
+                    self._action_type   = 'chop'
+                    return
+
+    def interact(self, world):
+        """ESPACIO: recolectar árboles y piedras (con o sin herramienta)."""
+        for chunk in world.active_chunks.values():
+            for tree in chunk.trees:
+                if self.is_near(tree):
+                    has_axe = self.inventory.has_axe_equipped()
+                    if has_axe and not self.is_chopping:
+                        self.is_chopping    = True
+                        self.chop_timer     = pygame.time.get_ticks()
+                        self.chop_frame     = 0
+                        self._chop_cycles   = 0
+                        self._action_target = tree
+                        self._action_type   = 'chop'
+                    elif not has_axe:
+                        self._action_target = tree
+                        self._execute_action('chop')
+                    return
+        for chunk in world.active_chunks.values():
+            for stone in chunk.small_stones:
+                if self.is_near(stone):
+                    self._action_target = stone
+                    self._execute_action('mine')
+                    return
+
+    def drink_water(self, world):
+        """Tecla E: beber agua o regar farmland cercano."""
+        return self.water_farmland(world)
+
+    def _execute_action(self, action_kind: str):
+        target = self._action_target
+        if target is None:
+            return
+        world = self._world
+        if world is None:
+            return
+
+        if action_kind == 'chop' and hasattr(target, 'chop'):
+            result = target.chop(with_axe=self.inventory.has_axe_equipped())
+            if result in ("chopped", "destroyed"):
+                self.inventory.add_item("wood", 1)
+                print(f"[chop] +1 madera (total {self.inventory.get_quantity('wood')})")
+            if result == "destroyed":
+                for chunk in world.active_chunks.values():
+                    if target in chunk.trees:
+                        chunk.trees.remove(target)
+                        break
+                self._action_target = None
+
+        elif action_kind == 'mine' and hasattr(target, 'mine'):
+            if target.mine():
+                self.inventory.add_item("stone", 1)
+                print(f"[mine] +1 piedra (total {self.inventory.get_quantity('stone')})")
+            if getattr(target, 'stone', 0) == 0:
+                for chunk in world.active_chunks.values():
+                    if target in chunk.small_stones:
+                        chunk.small_stones.remove(target)
+                        break
+                self._action_target = None
+
+        elif action_kind == 'hoe' and isinstance(target, tuple):
+            world.add_farmland(target[0], target[1])
+            print(f"[hoe] farmland en {target}")
+            self._action_target = None
+
+    # ── HUD ───────────────────────────────────────────────────────────────────
+    def draw_inventory(self, screen, show_inventory=False):
+        self.inventory.draw(screen, show_inventory)
+        if show_inventory:
+            font = pygame.font.Font(None, 22)
+            txt = font.render("I: cerrar inventario", True, constants.WHITE)
+            screen.blit(txt, (constants.WIDTH//2 - txt.get_width()//2, constants.HEIGHT - 30))
+
+    def update_energy(self, a):  self.energy  = max(0, min(MAX_ENERGY,  self.energy  + a))
+    def update_food(self, a):    self.food    = max(0, min(MAX_FOOD,    self.food    + a))
+    def update_thirst(self, a):  self.thirst  = max(0, min(MAX_THIRST,  self.thirst  + a))
+    def update_stamina(self, a): self.stamina = max(0, min(MAX_STAMINA, self.stamina + a))
+
+    def draw_status_bars(self, screen, world=None):
+        bw, bh, sp, x, y = 100, 10, 10, 10, 10
+        font = pygame.font.SysFont(None, 19)
+        for label, val, maxv, color in [
+            ("Energía", self.energy,  MAX_ENERGY,  constants.ENERGY_COLOR),
+            ("Comida",  self.food,    MAX_FOOD,    constants.FOOD_COLOR),
+            ("Sed",     self.thirst,  MAX_THIRST,  constants.THIRST_COLOR),
+            ("Stamina", self.stamina, MAX_STAMINA, constants.STAMINA_COLOR),
+        ]:
+            pygame.draw.rect(screen, constants.BAR_BACKGROUND_COLOR, (x, y, bw, bh))
+            pygame.draw.rect(screen, color, (x, y, int(bw * val / maxv), bh))
+            screen.blit(font.render(f"{label}: {int(val)}", True, constants.WHITE),
+                        (x + bw + 5, y))
+            y += bh + sp
+
+        if world is not None:
+            tod = (world.current_time / constants.DAY_LENGTH) * 24
+            screen.blit(font.render(f"Hora: {int(tod):02d}:00", True, constants.WHITE), (x, y))
+            y += bh + sp
+            if self.is_in_water(world):
+                screen.blit(
+                    font.render("~ En agua ~ (E: beber)", True, (100, 180, 255)),
+                    (x, y))
+
+    def update_status(self, world=None, dt_seconds: float = 1.0):
+        fr = constants.FOOD_DECREASE_RATE   * (RUN_FOOD_DECREASE_MULTIPLIER   if self.is_running else 1)
+        tr = constants.THIRST_DECREASE_RATE * (RUN_THIRST_DECREASE_MULTIPLIER if self.is_running else 1)
+        self.update_food(-fr * dt_seconds)
+        self.update_thirst(-tr * dt_seconds)
+        if self.food < MAX_FOOD * 0.2 or self.thirst < MAX_THIRST * 0.2:
+            self.update_energy(-constants.ENERGY_DECREASE_RATE * dt_seconds)
+        else:
+            self.update_energy(constants.ENERGY_INCREASE_RATE * dt_seconds)
+        if self.is_running and self.stamina > 0:
+            self.update_stamina(-constants.STAMINA_DECREASE_RATE * dt_seconds)
+        else:
+            self.update_stamina(constants.STAMINA_INCREASE_RATE * dt_seconds)
+
+# ===== FILE: constants.py =====
+
+# ============================================================
+# constants.py
+# ============================================================
+import os
+
+CHUNK_SIZE = 512
+WIDTH, HEIGHT = 1128, 634
+PLAYER = 100
+GRASS_SIZE = 50
+TREE_SIZE = 70
+SMALL_STONE_SIZE = 32
+INVENTORY_WIDTH = 300
+INVENTORY_HEIGHT = 150
+
+TREE_IMAGE_SIZE = 100
+STONE_IMAGE_SIZE = 40
+
+# Animaciones personaje
+CUADROS_BASICOS = 6
+IDLE_DOWN = 0
+IDLE_RIGHT = 1
+IDLE_UP = 2
+WALK_DOWN = 3
+WALK_RIGHT = 4
+WALK_UP = 5
+FRAME_SIZE = 32
+ANIMATION_DELAY = 100
+RUNNING_ANIMATION_DELAY = 50
+
+# Colores
+WHITE = (255, 255, 255)
+BLUE  = (0, 0, 255)
+BLACK = (0, 0, 0)
+RED   = (255, 0, 0)
+GREEN = (0, 255, 0)
+BROWN = (165, 42, 42)
+INVENTORY_COLOR = (0, 0, 0, 128)
+
+# Barras de estado
+MAX_ENERGY  = 100
+MAX_FOOD    = 100
+MAX_THIRST  = 100
+MAX_STAMINA = 100
+
+ENERGY_COLOR  = (255, 255, 0)
+FOOD_COLOR    = (255, 165, 0)
+THIRST_COLOR  = (0, 191, 255)
+STAMINA_COLOR = (124, 252, 0)
+BAR_BACKGROUND_COLOR = (50, 50, 50)
+
+STATUS_UPDATE_INTERVAL = 1000  # ms
+
+# Día/noche
+DAY_LENGTH      = 240000
+DAWN_TIME       = 60000
+MORNING_TIME    = 80000
+DUSK_TIME       = 180000
+MIDNIGHT_TIME   = 240000
+MAX_DARKNESS    = 180
+DAY_COLOR       = (255, 255, 255)
+DAWN_DUSK_COLOR = (255, 180, 100)
+NIGHT_COLOR     = (20, 20, 50)
+
+# Tasas de estado
+FOOD_DECREASE_RATE    = 0.01
+THIRST_DECREASE_RATE  = 0.02
+ENERGY_DECREASE_RATE  = 0.005
+ENERGY_INCREASE_RATE  = 0.01
+MOVEMENT_ENERGY_COST  = 0.1
+
+# Velocidad
+WALK_SPEED = 5
+RUN_SPEED  = 8
+STAMINA_DECREASE_RATE = 0.05
+STAMINA_INCREASE_RATE = 0.02
+RUN_FOOD_DECREASE_MULTIPLIER   = 2.0
+RUN_THIRST_DECREASE_MULTIPLIER = 2.0
+
+# Inventario
+SLOT_SIZE       = 64
+HOTBAR_SLOTS    = 8
+INVENTORY_COLS  = 5
+INVENTORY_ROWS  = 4
+MARGIN          = 10
+
+HOTBAR_X = (WIDTH - (SLOT_SIZE * HOTBAR_SLOTS)) // 2
+HOTBAR_Y = HEIGHT - SLOT_SIZE - MARGIN
+
+INVENTORY_X = (WIDTH  - (SLOT_SIZE * INVENTORY_COLS)) // 2
+INVENTORY_Y = (HEIGHT - (SLOT_SIZE * INVENTORY_ROWS)) // 2
+
+CRAFTING_GRID_SIZE     = 2
+CRAFTING_RESULT_SLOT_X = INVENTORY_X + (SLOT_SIZE * (INVENTORY_COLS + 1))
+CRAFTING_RESULT_SLOT_Y = INVENTORY_Y
+CRAFTING_GRID_X        = INVENTORY_X + (SLOT_SIZE * (INVENTORY_COLS + 1))
+CRAFTING_GRID_Y        = INVENTORY_Y + SLOT_SIZE * 2
+
+LEFT_HAND_SLOT_X  = HOTBAR_X - SLOT_SIZE - MARGIN
+LEFT_HAND_SLOT_Y  = HOTBAR_Y
+RIGHT_HAND_SLOT_X = HOTBAR_X + (SLOT_SIZE * HOTBAR_SLOTS) + MARGIN
+RIGHT_HAND_SLOT_Y = HOTBAR_Y
+
+# Herramientas
+AXE_COLS            = 2
+AXE_FRAMES          = 2
+AXE_ANIMATION_DELAY = 180
+
+HOE_COLS            = 2
+HOE_FRAMES          = 2
+HOE_ANIMATION_DELAY = 200
+
+# Colores inventario
+SLOT_COLOR  = (139, 139, 139)
+SLOT_BORDER = (100, 100, 100)
+SLOT_HOVER  = (160, 160, 160)
+
+# ── AGUA ──────────────────────────────────────────────────────────────────────
+WATER_COLOR                  = (30, 100, 200, 180)
+WATER_SIZE                   = 50
+WATER_GENERATION_PROBABILITY = 0.25
+WATER_MOVEMENT_MULTIPLIER    = 0.5
+WATER_THIRST_RECOVERY        = 20
+# Radio en px para considerar "cerca del agua" (riego automático)
+WATER_AUTO_IRRIGATE_RADIUS   = 200
+
+# ── AGRICULTURA ───────────────────────────────────────────────────────────────
+# Semillas por tile de farmland (grilla 4×2)
+FARM_SEEDS_PER_TILE   = 8
+FARM_GRID_COLS        = 4
+FARM_GRID_ROWS        = 2
+
+# Fases de crecimiento: 0=sembrado, 1-4=creciendo, 5=listo
+FARM_PHASE_PLANTED    = 0
+FARM_PHASE_READY      = 5
+FARM_TOTAL_PHASES     = 6   # 0..5
+
+# Tiempo (ms) que tarda en avanzar una fase CUANDO está regado
+FARM_GROWTH_TIME_MS   = 30_000   # 30 segundos por fase
+
+# El tile se pausa si no hay agua cerca (no muere, no crece)
+# Duración del riego manual (ms) — cuánto tiempo dura cada regado con E
+FARM_MANUAL_WATER_DURATION = 60_000   # 60 segundos por regada manual
+# Zanahorias cosechadas que da un tile completo al cosechar
+FARM_YIELD_PER_TILE   = 8
+
+# ── RUTAS DE IMÁGENES DE AGRICULTURA (definidas aquí para centralizar) ────────
+_IMG = os.path.join("assets", "images")
+
+# Fondo farmland
+IMG_FARMLAND          = os.path.join(_IMG, "objects", "FarmLand.png")
+
+# Cartel que aparece encima del farmland cuando hay plantas
+IMG_CROP_SIGN_CARROT  = os.path.join(_IMG, "zanahoria","zanahoria_cartel_2.png")
+
+# Fases visuales del cultivo (índices 0-3 → fases 1-4 de crecimiento)
+IMG_CARROT_PHASES = [
+    os.path.join(_IMG,"zanahoria", "zanahoria_fase_3.png"),   # fase 1 (recién brotó)
+    os.path.join(_IMG, "zanahoria","zanahoria_fase_4.png"),   # fase 2
+    os.path.join(_IMG, "zanahoria","zanahoria_fase_5.png"),   # fase 3
+    os.path.join(_IMG,"zanahoria", "zanahoria_fase_6.png"),   # fase 4 (lista)
+]
+
+# Ícono de semilla de zanahoria (para inventario)
+IMG_CARROT_SEED       = os.path.join(_IMG, "zanahoria","zanahoria_icono_0.png")
+# Ícono de zanahoria cosechada (para inventario)
+IMG_CARROT_HARVESTED  = os.path.join(_IMG, "zanahoria","zanahoria_icono_1.png")
+
+# ── INDICADORES VISUALES DE RIEGO ─────────────────────────────────────────────
+FARM_WET_COLOR   = (60, 130, 220, 120)   # overlay azulado cuando está regado
+FARM_DRY_COLOR   = (180, 140, 80,  80)   # overlay marrón cuando está seco
+
+# Nombre de ítems (para inventario)
+ITEM_CARROT_SEED      = "carrot_seed"
+ITEM_CARROT           = "carrot"
+
+# ===== FILE: elements.py =====
+
+"""
+elements.py — Objetos del mundo: árbol, piedra, farmland, agua, cultivos.
+"""
+import math
+import os
+import pygame
+import constants
+
+
+# ── Utilidad: carga segura de imagen ─────────────────────────────────────────
+def _load(path, fallback_color=(180, 60, 180), size=None):
+    try:
+        surf = pygame.image.load(path).convert_alpha()
+        if size:
+            surf = pygame.transform.scale(surf, size)
+        return surf
+    except Exception:
+        w, h = size if size else (32, 32)
+        s = pygame.Surface((w, h), pygame.SRCALPHA)
+        s.fill((*fallback_color, 200))
+        return s
+
+
+# ── Árbol ─────────────────────────────────────────────────────────────────────
+class Tree:
+    def __init__(self, x, y, size=constants.TREE_SIZE):
+        self.x = x
+        self.y = y
+        self.size = size
+        self.wood = 5
+        self.rect = pygame.Rect(
+            int(self.x + constants.TREE_SIZE / 2.5),
+            self.y + 7,
+            int(constants.TREE_SIZE / 1.5),
+            constants.TREE_SIZE - 40
+        )
+        self.image = _load(
+            os.path.join("assets","images","objects","tree.png"),
+            (0,120,0),
+            (constants.TREE_IMAGE_SIZE, constants.TREE_IMAGE_SIZE)
+        )
+
+    def draw(self, screen, camera_x, camera_y):
+        sx = self.x - camera_x
+        sy = self.y - camera_y
+        if -self.size <= sx <= constants.WIDTH and -self.size <= sy <= constants.HEIGHT:
+            screen.blit(self.image, (sx, sy + self.size - self.image.get_height()))
+
+    def chop(self, with_axe=False):
+        if self.wood > 0:
+            self.wood -= 2 if with_axe else 1
+            if self.wood <= 0:
+                self.wood = 0
+                return "destroyed"
+            return "chopped"
+        return "empty"
+
+
+# ── Piedra ────────────────────────────────────────────────────────────────────
+class SmallStone:
+    def __init__(self, x, y, size=constants.SMALL_STONE_SIZE):
+        self.x = x
+        self.y = y
+        self.size = size
+        self.stone = 3
+        self.rect = pygame.Rect(
+            self.x + constants.STONE_IMAGE_SIZE // 3,
+            self.y + constants.STONE_IMAGE_SIZE - 10,
+            constants.STONE_IMAGE_SIZE // 3,
+            10
+        )
+        self.image = _load(
+            os.path.join("assets","images","objects","small_stone.png"),
+            (150,150,150),
+            (constants.STONE_IMAGE_SIZE, constants.STONE_IMAGE_SIZE)
+        )
+
+    def draw(self, screen, camera_x, camera_y):
+        sx = self.x - camera_x
+        sy = self.y - camera_y
+        if -self.size <= sx <= constants.WIDTH and -self.size <= sy <= constants.HEIGHT:
+            screen.blit(self.image, (sx, sy + self.size - self.image.get_height()))
+
+    def mine(self):
+        if self.stone > 0:
+            self.stone -= 1
+            return True
+        return False
+
+
+# ── Agua ──────────────────────────────────────────────────────────────────────
+class Water:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.size = constants.WATER_SIZE
+        self.rect = pygame.Rect(x, y, self.size, self.size)
+        self.animation_frame = 0.0
+        self._surf = pygame.Surface((self.size, self.size), pygame.SRCALPHA)
+        self._surf.fill(constants.WATER_COLOR)
+
+    def update(self, dt):
+        self.animation_frame += dt * 0.003
+
+    def draw(self, screen, camera_x, camera_y):
+        sx = self.x - camera_x
+        sy = self.y - camera_y
+        if -self.size <= sx <= constants.WIDTH and -self.size <= sy <= constants.HEIGHT:
+            oy = int(math.sin(self.animation_frame) * 2)
+            screen.blit(self._surf, (sx, sy + oy))
+
+
+# ── Farmland con sistema de cultivo ───────────────────────────────────────────
+class Farmland:
+    """
+    Tile de tierra cultivable (GRASS_SIZE × GRASS_SIZE).
+
+    Estados de cada tile:
+      - empty      : farmland vacío, espera semillas
+      - planted    : sembrado (fase 0), necesita agua para crecer
+      - growing    : fases 1-4 de crecimiento (se pausa sin agua cerca)
+      - ready      : fase 5, listo para cosechar
+      - harvested  : cosechado, vuelve a 'empty' tras un momento
+    """
+
+    # Imágenes compartidas entre todas las instancias (cargadas 1 sola vez)
+    _img_base   = None   # fondo farmland
+    _img_sign   = None   # cartel zanahoria
+    _img_phases = None   # lista de 4 superficies (fases 1-4)
+    _img_wet    = None   # overlay húmedo
+    _img_dry    = None   # overlay seco
+
+    @classmethod
+    def _ensure_images(cls):
+        if cls._img_base is not None:
+            return
+        ts = constants.GRASS_SIZE   # 50 px
+
+        cls._img_base = _load(constants.IMG_FARMLAND,     (120,80,40),  (ts, ts))
+
+        # Cartel: dibujarlo más grande encima del tile (ancho=tile, alto proporcional)
+        sign_raw = _load(constants.IMG_CROP_SIGN_CARROT, (80,60,20))
+        sw, sh   = sign_raw.get_size()
+        ratio    = sh / sw if sw > 0 else 1
+        sign_w   = ts
+        sign_h   = max(12, int(sign_w * ratio))
+        cls._img_sign = pygame.transform.scale(sign_raw, (sign_w, sign_h))
+
+        # 4 fases de crecimiento — caben 4 columnas × 2 filas dentro del tile
+        cell_w = ts // constants.FARM_GRID_COLS   # 12 px
+        cell_h = ts // constants.FARM_GRID_ROWS   # 25 px
+        cls._img_phases = []
+        for path in constants.IMG_CARROT_PHASES:
+            raw = _load(path, (0, 200, 80))
+            cls._img_phases.append(
+                pygame.transform.scale(raw, (cell_w, cell_h))
+            )
+
+        # Overlays de humedad
+        cls._img_wet = pygame.Surface((ts, ts), pygame.SRCALPHA)
+        cls._img_wet.fill(constants.FARM_WET_COLOR)
+        cls._img_dry = pygame.Surface((ts, ts), pygame.SRCALPHA)
+        cls._img_dry.fill(constants.FARM_DRY_COLOR)
+
+    def __init__(self, x, y):
+        Farmland._ensure_images()
+        self.x    = x
+        self.y    = y
+        self.size = constants.GRASS_SIZE
+
+        # ── Estado del cultivo ────────────────────────────────────────────────
+        self.crop_type   = "carrot"          # extensible a otros cultivos
+        self.state       = "empty"           # empty | planted | growing | ready | harvested
+        self.phase       = 0                 # 0-5
+        self.seeds_count = 0                 # semillas sembradas (0-8)
+        self.is_watered  = False             # ¿tiene agua cerca ahora mismo?
+        self._growth_timer = 0               # ms acumulados desde último riego
+
+        # Timer para volver de 'harvested' a 'empty'
+        self._harvest_reset_timer = 0
+        self._manual_water_timer = 0    # ms restantes de riego manual (tecla E)
+
+    # ── Siembra ──────────────────────────────────────────────────────────────
+    def plant(self, seeds_available: int) -> int:
+        """
+        Siembra seeds_available semillas (hasta FARM_SEEDS_PER_TILE).
+        Devuelve cuántas semillas se usaron.
+        """
+        if self.state != "empty":
+            return 0
+        to_plant = min(seeds_available, constants.FARM_SEEDS_PER_TILE)
+        if to_plant <= 0:
+            return 0
+        self.seeds_count = to_plant
+        self.state       = "planted"
+        self.phase       = constants.FARM_PHASE_PLANTED
+        self._growth_timer = 0
+        return to_plant
+
+    # ── Cosecha ───────────────────────────────────────────────────────────────
+    def harvest_one(self) -> int:
+        """
+        Cosecha 1 zanahoria del tile. El tile sigue en 'ready' hasta agotar las 8.
+        Devuelve 1 si cosechó, 0 si no había nada.
+        """
+        if self.state != "ready":
+            return 0
+        self.seeds_count -= 1
+        if self.seeds_count <= 0:
+            # Tile completamente cosechado
+            self.seeds_count          = 0
+            self.state                = "harvested"
+            self._harvest_reset_timer = 2000   # 2 s y vuelve a empty
+            self.phase                = 0
+        return 1
+
+    def harvest(self) -> int:
+        """Alias: cosecha todo el tile de una vez (para compatibilidad)."""
+        total = 0
+        while self.state == "ready":
+            total += self.harvest_one()
+        return total
+
+    # ── Actualización ─────────────────────────────────────────────────────────
+    def update(self, dt: int, water_nearby: bool):
+        """
+        dt: milisegundos desde el último frame.
+        water_nearby: True si hay un tile de agua dentro del radio definido.
+        """
+        self.is_watered = water_nearby
+
+        # Reset a empty tras cosecha
+        if self.state == "harvested":
+            self._harvest_reset_timer -= dt
+            if self._harvest_reset_timer <= 0:
+                self.state = "empty"
+            return
+
+        if self.state not in ("planted", "growing"):
+            return
+
+        # Solo crece si hay agua cerca
+        if not self.is_watered:
+            return
+
+        self._growth_timer += dt
+        if self._growth_timer >= constants.FARM_GROWTH_TIME_MS:
+            self._growth_timer -= constants.FARM_GROWTH_TIME_MS
+            self.phase += 1
+            if self.phase >= constants.FARM_PHASE_READY:
+                self.phase = constants.FARM_PHASE_READY
+                self.state = "ready"
+            else:
+                self.state = "growing"
+
+    # ── Dibujado ─────────────────────────────────────────────────────────────
+    def draw(self, screen, camera_x, camera_y):
+        sx = self.x - camera_x
+        sy = self.y - camera_y
+        ts = constants.GRASS_SIZE
+        if sx + ts < 0 or sx > constants.WIDTH or sy + ts < 0 or sy > constants.HEIGHT:
+            return
+
+        # 1. Fondo farmland
+        screen.blit(self._img_base, (sx, sy))
+
+        # 2. Overlay húmedo/seco (solo si hay algo sembrado)
+        if self.state in ("planted", "growing", "ready"):
+            screen.blit(self._img_wet if self.is_watered else self._img_dry, (sx, sy))
+
+        # 3. Plantas en la grilla 4×2
+        if self.state in ("growing", "ready") and self.phase >= 1:
+            phase_idx   = min(self.phase - 1, len(self._img_phases) - 1)
+            plant_surf  = self._img_phases[phase_idx]
+            cell_w      = ts // constants.FARM_GRID_COLS
+            cell_h      = ts // constants.FARM_GRID_ROWS
+            for i in range(self.seeds_count):
+                col = i % constants.FARM_GRID_COLS
+                row = i // constants.FARM_GRID_COLS
+                px  = sx + col * cell_w + (cell_w - plant_surf.get_width())  // 2
+                py  = sy + row * cell_h + (cell_h - plant_surf.get_height()) // 2
+                screen.blit(plant_surf, (px, py))
+
+        # 4. Cartel cuando hay cultivo activo (encima del tile, desplazado hacia arriba)
+        if self.state in ("planted", "growing", "ready"):
+            sign_x = sx + (ts - self._img_sign.get_width()) // 2
+            sign_y = sy - self._img_sign.get_height() - 2
+            screen.blit(self._img_sign, (sign_x, sign_y))
+
+        # 5. Barra de progreso de crecimiento (debajo del tile)
+        if self.state in ("planted", "growing") and self.is_watered:
+            bar_w   = ts - 4
+            bar_h   = 4
+            bx      = sx + 2
+            by      = sy + ts + 2
+            # progreso dentro de la fase actual
+            progress = self._growth_timer / constants.FARM_GROWTH_TIME_MS
+            pygame.draw.rect(screen, (50, 50, 50),   (bx, by, bar_w, bar_h))
+            pygame.draw.rect(screen, (80, 220, 80),  (bx, by, int(bar_w * progress), bar_h))
+
+        # 6. Indicador "LISTO" cuando está para cosechar
+        if self.state == "ready":
+            font = pygame.font.SysFont(None, 16)
+            txt  = font.render("✓", True, (255, 255, 80))
+            screen.blit(txt, (sx + ts // 2 - txt.get_width() // 2, sy - 14))
+
+# ===== FILE: inventory.py =====
+
+import os
+import pygame
+import constants
+
+pygame.font.init()
+
+
+class InventoryItems:
+    def __init__(self, name, image_path, quantity=1):
+        self.name = name
+        self.quantity = quantity
+        try:
+            surf = pygame.image.load(image_path).convert_alpha()
+            self.image = pygame.transform.scale(surf, (constants.SLOT_SIZE - 10, constants.SLOT_SIZE - 10))
+        except Exception:
+            self.image = pygame.Surface((constants.SLOT_SIZE - 10, constants.SLOT_SIZE - 10), pygame.SRCALPHA)
+            self.image.fill((180, 180, 180))
+            txt = pygame.font.SysFont(None, 14).render(name[:3].upper(), True, (0, 0, 0))
+            self.image.blit(txt, (4, 4))
+        self.dragging = False
+        self.drag_offset = (0, 0)
+
+
+class Inventory:
+    def __init__(self):
+        self.left_hand = None
+        self.right_hand = None
+        self.hotbar = [None] * constants.HOTBAR_SLOTS
+        self.inventory = [[None for _ in range(constants.INVENTORY_COLS)]
+                          for _ in range(constants.INVENTORY_ROWS)]
+        self.crafting_grid = [[None for _ in range(constants.CRAFTING_GRID_SIZE)]
+                              for _ in range(constants.CRAFTING_GRID_SIZE)]
+        self.crafting_result = None
+        self._last_recipe = None
+        self.dragged_item = None
+
+        self.title_font = pygame.font.SysFont(None, 18)
+        self.qty_font = pygame.font.SysFont(None, 16)
+
+        self.item_images = {
+            "wood":        os.path.join("assets", "images", "objects", "wood.png"),
+            "stone":       os.path.join("assets", "images", "objects", "small_stone.png"),
+            "axe":         os.path.join("assets", "images", "objects", "axe.png"),
+            "hoe":         os.path.join("assets", "images", "objects", "hoe.png"),
+            "carrot_seed": constants.IMG_CARROT_SEED,
+            "carrot":      constants.IMG_CARROT_HARVESTED,
+        }
+
+        # -------------------------------------------------------
+        # Recetas — grilla 2×2:
+        #   [fila0_col0, fila0_col1]
+        #   [fila1_col0, fila1_col1]
+        #
+        # FIX: patrones simples con 1 ítem por celda.
+        # hacha  → wood en [0,0]  y  stone en [0,1]
+        # pala   → stone en [0,0] y  wood  en [0,1]
+        # nueva  → wood + carrot -> 4 carrot_seed
+        # -------------------------------------------------------
+        self.recipes = {
+            'axe': {
+                'pattern': [['wood', 'stone'],
+                            [None,  None   ]],
+                'result': 'axe',
+                'result_qty': 1
+            },
+            'hoe': {
+                'pattern': [['stone', 'wood'],
+                            [None,   None  ]],
+                'result': 'hoe',
+                'result_qty': 1
+            },
+            'carrot_to_seeds': {
+                'pattern': [['wood', 'carrot'],
+                            [None,   None  ]],
+                'result': 'carrot_seed',
+                'result_qty': 4
+            },
+        }
+        print("[Inventory] initialized")
+
+    # -----------------------
+    # Item management
+    # -----------------------
+    def add_item(self, item_name, quantity=1):
+        print(f"[add_item] {item_name} x{quantity}")
+        for r in range(constants.INVENTORY_ROWS):
+            for c in range(constants.INVENTORY_COLS):
+                slot = self.inventory[r][c]
+                if slot and slot.name == item_name:
+                    slot.quantity += quantity
+                    return True
+        for i, slot in enumerate(self.hotbar):
+            if slot and slot.name == item_name:
+                slot.quantity += quantity
+                return True
+        for r in range(constants.INVENTORY_ROWS):
+            for c in range(constants.INVENTORY_COLS):
+                if self.inventory[r][c] is None:
+                    self.inventory[r][c] = InventoryItems(item_name, self.item_images.get(item_name, ""), quantity)
+                    return True
+        for i in range(constants.HOTBAR_SLOTS):
+            if self.hotbar[i] is None:
+                self.hotbar[i] = InventoryItems(item_name, self.item_images.get(item_name, ""), quantity)
+                return True
+        print(f"[add_item] No space for {item_name}")
+        return False
+
+    def get_quantity(self, item_name):
+        total = 0
+        for slot in self.hotbar:
+            if slot and slot.name == item_name:
+                total += slot.quantity
+        for r in range(constants.INVENTORY_ROWS):
+            for c in range(constants.INVENTORY_COLS):
+                slot = self.inventory[r][c]
+                if slot and slot.name == item_name:
+                    total += slot.quantity
+        return total
+
+    # -----------------------
+    # Drawing
+    # -----------------------
+    def draw(self, screen, show_inventory=False):
+        # Hotbar
+        for i in range(constants.HOTBAR_SLOTS):
+            x = constants.HOTBAR_X + i * constants.SLOT_SIZE
+            y = constants.HOTBAR_Y
+            pygame.draw.rect(screen, constants.SLOT_BORDER, (x, y, constants.SLOT_SIZE, constants.SLOT_SIZE))
+            pygame.draw.rect(screen, constants.SLOT_COLOR,  (x+2, y+2, constants.SLOT_SIZE-4, constants.SLOT_SIZE-4))
+            if self.hotbar[i]:
+                self._draw_item(screen, self.hotbar[i], x, y)
+
+        # Manos
+        for slot_x, slot_y, item, label in [
+            (constants.LEFT_HAND_SLOT_X,  constants.LEFT_HAND_SLOT_Y,  self.left_hand,  "L.Hand"),
+            (constants.RIGHT_HAND_SLOT_X, constants.RIGHT_HAND_SLOT_Y, self.right_hand, "R.Hand"),
+        ]:
+            pygame.draw.rect(screen, constants.SLOT_BORDER, (slot_x, slot_y, constants.SLOT_SIZE, constants.SLOT_SIZE))
+            pygame.draw.rect(screen, constants.SLOT_COLOR,  (slot_x+2, slot_y+2, constants.SLOT_SIZE-4, constants.SLOT_SIZE-4))
+            lbl = self.title_font.render(label, True, constants.WHITE)
+            screen.blit(lbl, (slot_x, slot_y - lbl.get_height() - 2))
+            if item:
+                self._draw_item(screen, item, slot_x, slot_y)
+
+        if show_inventory:
+            # Panel de fondo
+            panel_w = constants.SLOT_SIZE * constants.INVENTORY_COLS + 20
+            panel_h = constants.SLOT_SIZE * constants.INVENTORY_ROWS + 50
+            panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+            panel.fill((0, 0, 0, 200))
+            screen.blit(panel, (constants.INVENTORY_X, constants.INVENTORY_Y))
+
+            lbl = self.title_font.render("Inventory", True, constants.WHITE)
+            screen.blit(lbl, (constants.INVENTORY_X + 8, constants.INVENTORY_Y + 6))
+
+            # FIX: calcular start_y del grid del inventario igual que en handle_click
+            inv_grid_start_y = constants.INVENTORY_Y + 6 + lbl.get_height() + 6
+            for row in range(constants.INVENTORY_ROWS):
+                for col in range(constants.INVENTORY_COLS):
+                    sx = constants.INVENTORY_X + 10 + col * constants.SLOT_SIZE
+                    sy = inv_grid_start_y + row * constants.SLOT_SIZE
+                    pygame.draw.rect(screen, constants.SLOT_BORDER, (sx, sy, constants.SLOT_SIZE, constants.SLOT_SIZE))
+                    pygame.draw.rect(screen, constants.SLOT_COLOR,  (sx+2, sy+2, constants.SLOT_SIZE-4, constants.SLOT_SIZE-4))
+                    if self.inventory[row][col]:
+                        self._draw_item(screen, self.inventory[row][col], sx, sy)
+
+            # Grilla de crafteo
+            craft_title = self.title_font.render("Crafting  (wood+stone → axe  |  stone+wood → hoe)", True, constants.WHITE)
+            screen.blit(craft_title, (constants.CRAFTING_GRID_X, constants.CRAFTING_GRID_Y - craft_title.get_height() - 6))
+            for r in range(constants.CRAFTING_GRID_SIZE):
+                for c in range(constants.CRAFTING_GRID_SIZE):
+                    sx = constants.CRAFTING_GRID_X + c * constants.SLOT_SIZE
+                    sy = constants.CRAFTING_GRID_Y + r * constants.SLOT_SIZE
+                    pygame.draw.rect(screen, constants.SLOT_BORDER, (sx, sy, constants.SLOT_SIZE, constants.SLOT_SIZE))
+                    pygame.draw.rect(screen, constants.SLOT_COLOR,  (sx+2, sy+2, constants.SLOT_SIZE-4, constants.SLOT_SIZE-4))
+                    if self.crafting_grid[r][c]:
+                        self._draw_item(screen, self.crafting_grid[r][c], sx, sy)
+
+            # Slot resultado
+            res_title = self.title_font.render("Result", True, constants.WHITE)
+            screen.blit(res_title, (constants.CRAFTING_RESULT_SLOT_X, constants.CRAFTING_RESULT_SLOT_Y - res_title.get_height() - 6))
+            pygame.draw.rect(screen, constants.SLOT_BORDER,
+                             (constants.CRAFTING_RESULT_SLOT_X, constants.CRAFTING_RESULT_SLOT_Y,
+                              constants.SLOT_SIZE, constants.SLOT_SIZE))
+            pygame.draw.rect(screen, constants.SLOT_COLOR,
+                             (constants.CRAFTING_RESULT_SLOT_X+2, constants.CRAFTING_RESULT_SLOT_Y+2,
+                              constants.SLOT_SIZE-4, constants.SLOT_SIZE-4))
+            if self.crafting_result:
+                self._draw_item(screen, self.crafting_result,
+                                constants.CRAFTING_RESULT_SLOT_X, constants.CRAFTING_RESULT_SLOT_Y)
+
+            help_txt = self.title_font.render("I: cerrar  •  Drag: mover items  •  Click Result: craftear", True, constants.WHITE)
+            screen.blit(help_txt, (constants.INVENTORY_X + 8,
+                                   constants.INVENTORY_Y + panel_h - help_txt.get_height() - 8))
+
+        # Ítem arrastrado (siempre encima de todo)
+        if self.dragged_item and self.dragged_item.image:
+            mx, my = pygame.mouse.get_pos()
+            img = self.dragged_item.image
+            screen.blit(img, (mx - img.get_width() // 2, my - img.get_height() // 2))
+            if self.dragged_item.quantity > 1:
+                qty_text = self.qty_font.render(str(self.dragged_item.quantity), True, constants.WHITE)
+                screen.blit(qty_text, (mx + img.get_width()//2 - qty_text.get_width(),
+                                       my + img.get_height()//2 - qty_text.get_height()))
+
+    def _draw_item(self, screen, item, x, y):
+        ix = x + (constants.SLOT_SIZE - item.image.get_width()) // 2
+        iy = y + (constants.SLOT_SIZE - item.image.get_height()) // 2
+        screen.blit(item.image, (ix, iy))
+        if item.quantity > 1:
+            text = self.qty_font.render(str(item.quantity), True, constants.WHITE)
+            screen.blit(text, (x + constants.SLOT_SIZE - text.get_width() - 5,
+                               y + constants.SLOT_SIZE - text.get_height() - 5))
+
+    # -----------------------
+    # Clicks
+    # -----------------------
+    def handle_click(self, pos, button, show_inventory=False):
+        mx, my = pos
+
+        # Manos
+        if (constants.LEFT_HAND_SLOT_X <= mx <= constants.LEFT_HAND_SLOT_X + constants.SLOT_SIZE and
+                constants.LEFT_HAND_SLOT_Y <= my <= constants.LEFT_HAND_SLOT_Y + constants.SLOT_SIZE):
+            self._handle_hand_slot_click(button, 'left')
+            return True
+        if (constants.RIGHT_HAND_SLOT_X <= mx <= constants.RIGHT_HAND_SLOT_X + constants.SLOT_SIZE and
+                constants.RIGHT_HAND_SLOT_Y <= my <= constants.RIGHT_HAND_SLOT_Y + constants.SLOT_SIZE):
+            self._handle_hand_slot_click(button, 'right')
+            return True
+
+        # Hotbar
+        if constants.HOTBAR_Y <= my <= constants.HOTBAR_Y + constants.SLOT_SIZE:
+            slot_index = (mx - constants.HOTBAR_X) // constants.SLOT_SIZE
+            if 0 <= slot_index < constants.HOTBAR_SLOTS:
+                self._handle_slot_click(button, self.hotbar, slot_index,
+                                        constants.HOTBAR_X + slot_index * constants.SLOT_SIZE,
+                                        constants.HOTBAR_Y)
+                return True
+
+        if show_inventory:
+            # FIX: calcular inv_grid_start_y igual que en draw()
+            lbl_h = self.title_font.size("Inventory")[1]
+            inv_grid_start_y = constants.INVENTORY_Y + 6 + lbl_h + 6
+            inv_grid_start_x = constants.INVENTORY_X + 10
+
+            # Grid inventario
+            inv_grid_end_x = inv_grid_start_x + constants.INVENTORY_COLS * constants.SLOT_SIZE
+            inv_grid_end_y = inv_grid_start_y + constants.INVENTORY_ROWS * constants.SLOT_SIZE
+            if inv_grid_start_x <= mx < inv_grid_end_x and inv_grid_start_y <= my < inv_grid_end_y:
+                col = (mx - inv_grid_start_x) // constants.SLOT_SIZE
+                row = (my - inv_grid_start_y) // constants.SLOT_SIZE
+                if 0 <= row < constants.INVENTORY_ROWS and 0 <= col < constants.INVENTORY_COLS:
+                    self._handle_grid_slot_click(button, row, col,
+                                                 inv_grid_start_x + col * constants.SLOT_SIZE,
+                                                 inv_grid_start_y + row * constants.SLOT_SIZE)
+                    return True
+
+            # Grid crafteo
+            cg_x1 = constants.CRAFTING_GRID_X
+            cg_y1 = constants.CRAFTING_GRID_Y
+            cg_x2 = cg_x1 + constants.CRAFTING_GRID_SIZE * constants.SLOT_SIZE
+            cg_y2 = cg_y1 + constants.CRAFTING_GRID_SIZE * constants.SLOT_SIZE
+            if cg_x1 <= mx < cg_x2 and cg_y1 <= my < cg_y2:
+                col = (mx - cg_x1) // constants.SLOT_SIZE
+                row = (my - cg_y1) // constants.SLOT_SIZE
+                if 0 <= row < constants.CRAFTING_GRID_SIZE and 0 <= col < constants.CRAFTING_GRID_SIZE:
+                    self._handle_crafting_grid_click(button, row, col)
+                    return True
+
+            # Slot resultado
+            rx1 = constants.CRAFTING_RESULT_SLOT_X
+            ry1 = constants.CRAFTING_RESULT_SLOT_Y
+            if rx1 <= mx <= rx1 + constants.SLOT_SIZE and ry1 <= my <= ry1 + constants.SLOT_SIZE:
+                self._handle_crafting_result_click(button)
+                return True
+
+        # Soltar fuera: devolver al inventario
+        if self.dragged_item and button == 1:
+            self._return_dragged_item()
+            return False
+
+    def _handle_slot_click(self, button, slot_list, index, slot_x, slot_y):
+        if button != 1:
+            return
+        mx, my = pygame.mouse.get_pos()
+        if self.dragged_item:
+            if slot_list[index] is None:
+                slot_list[index] = self.dragged_item
+                self.dragged_item = None
+            elif slot_list[index].name == self.dragged_item.name:
+                slot_list[index].quantity += self.dragged_item.quantity
+                self.dragged_item = None
+            else:
+                slot_list[index], self.dragged_item = self.dragged_item, slot_list[index]
+        elif slot_list[index]:
+            self.dragged_item = slot_list[index]
+            slot_list[index] = None
+            r = self.dragged_item.image.get_rect()
+            self.dragged_item.drag_offset = (mx - r.centerx, my - r.centery)
+
+    def _handle_grid_slot_click(self, button, row, col, slot_x, slot_y):
+        if button != 1:
+            return
+        mx, my = pygame.mouse.get_pos()
+        if self.dragged_item:
+            if self.inventory[row][col] is None:
+                self.inventory[row][col] = self.dragged_item
+                self.dragged_item = None
+            elif self.inventory[row][col].name == self.dragged_item.name:
+                self.inventory[row][col].quantity += self.dragged_item.quantity
+                self.dragged_item = None
+            else:
+                self.inventory[row][col], self.dragged_item = self.dragged_item, self.inventory[row][col]
+        elif self.inventory[row][col]:
+            self.dragged_item = self.inventory[row][col]
+            self.inventory[row][col] = None
+            r = self.dragged_item.image.get_rect()
+            self.dragged_item.drag_offset = (mx - r.centerx, my - r.centery)
+
+    def _handle_hand_slot_click(self, button, hand):
+        if button != 1:
+            return
+        if hand == 'left':
+            if self.dragged_item:
+                if self.dragged_item.name in ['axe', 'hoe']:
+                    self.left_hand, self.dragged_item = self.dragged_item, self.left_hand
+            elif self.left_hand:
+                self.dragged_item = self.left_hand
+                self.left_hand = None
+        else:
+            if self.dragged_item:
+                if self.dragged_item.name in ['axe', 'hoe']:
+                    self.right_hand, self.dragged_item = self.dragged_item, self.right_hand
+            elif self.right_hand:
+                self.dragged_item = self.right_hand
+                self.right_hand = None
+
+    def _return_dragged_item(self):
+        if not self.dragged_item:
+            return
+        name, qty = self.dragged_item.name, self.dragged_item.quantity
+        for r in range(constants.INVENTORY_ROWS):
+            for c in range(constants.INVENTORY_COLS):
+                if self.inventory[r][c] and self.inventory[r][c].name == name:
+                    self.inventory[r][c].quantity += qty
+                    self.dragged_item = None
+                    return
+        for i in range(constants.HOTBAR_SLOTS):
+            if self.hotbar[i] and self.hotbar[i].name == name:
+                self.hotbar[i].quantity += qty
+                self.dragged_item = None
+                return
+        for r in range(constants.INVENTORY_ROWS):
+            for c in range(constants.INVENTORY_COLS):
+                if self.inventory[r][c] is None:
+                    self.inventory[r][c] = self.dragged_item
+                    self.dragged_item = None
+                    return
+        for i in range(constants.HOTBAR_SLOTS):
+            if self.hotbar[i] is None:
+                self.hotbar[i] = self.dragged_item
+                self.dragged_item = None
+                return
+        print("[RETURN_DRAGGED] No space, discarding")
+        self.dragged_item = None
+
+    # -----------------------
+    # Crafteo
+    # -----------------------
+    def _handle_crafting_grid_click(self, button, row, col):
+        if button != 1:
+            return
+        if self.dragged_item:
+            if self.crafting_grid[row][col] is None:
+                self.crafting_grid[row][col] = self.dragged_item
+                self.dragged_item = None
+            elif self.crafting_grid[row][col].name == self.dragged_item.name:
+                self.crafting_grid[row][col].quantity += self.dragged_item.quantity
+                self.dragged_item = None
+            else:
+                self.crafting_grid[row][col], self.dragged_item = self.dragged_item, self.crafting_grid[row][col]
+            self._check_recipe()
+            return
+        if self.crafting_grid[row][col]:
+            self.dragged_item = self.crafting_grid[row][col]
+            self.crafting_grid[row][col] = None
+            self._check_recipe()
+
+    def _check_recipe(self):
+        """Comparación exacta posición a posición en la grilla 2×2."""
+        size = constants.CRAFTING_GRID_SIZE
+        current = [
+            [self.crafting_grid[r][c].name if self.crafting_grid[r][c] else None
+             for c in range(size)]
+            for r in range(size)
+        ]
+        self.crafting_result = None
+        self._last_recipe = None
+
+        print("[_check_recipe] grilla actual:", current)
+
+        for recipe_name, recipe in self.recipes.items():
+            pattern = recipe['pattern']
+            # La grilla es 2×2 y el patrón también, comparación directa celda a celda
+            match = all(
+                pattern[r][c] == current[r][c]
+                for r in range(size)
+                for c in range(size)
+            )
+            print(f"  receta '{recipe_name}' -> {'✓ MATCH' if match else 'no match'}")
+            if match:
+                # crear resultado con la cantidad definida en la receta (por defecto 1)
+                result_name = recipe['result']
+                result_qty = recipe.get('result_qty', 1)
+                self.crafting_result = InventoryItems(
+                    result_name,
+                    self.item_images.get(result_name, ""),
+                    result_qty
+                )
+                self._last_recipe = {'name': recipe_name, 'pattern': pattern}
+                print(f"[RECIPE] ¡Encontrada! {recipe_name} -> {result_name} x{result_qty}")
+                return
+
+    def _handle_crafting_result_click(self, button):
+        if button != 1 or not self.crafting_result or not self._last_recipe:
+            return
+        pattern = self._last_recipe['pattern']
+        size = constants.CRAFTING_GRID_SIZE
+        # Consumir 1 unidad de cada celda que el patrón requiere
+        for r in range(size):
+            for c in range(size):
+                if pattern[r][c] is not None:
+                    cell = self.crafting_grid[r][c]
+                    if cell:
+                        cell.quantity -= 1
+                        if cell.quantity <= 0:
+                            self.crafting_grid[r][c] = None
+        # Entregar el resultado (puede ser >1)
+        self.dragged_item = self.crafting_result
+        print(f"[CRAFT RESULT] crafteo exitoso: {self.dragged_item.name} x{self.dragged_item.quantity}")
+        self.crafting_result = None
+        self._last_recipe = None
+        self._check_recipe()
+
+    def attempt_craft(self):
+        """Llamado desde main.py con tecla C."""
+        self._check_recipe()
+        if not self._last_recipe:
+            print("[MAIN] No hay receta válida en la grilla")
+            return None
+        recipe_name = self._last_recipe['name']
+        pattern = self._last_recipe['pattern']
+        size = constants.CRAFTING_GRID_SIZE
+        # Consumir ingredientes
+        for r in range(size):
+            for c in range(size):
+                if pattern[r][c] is not None:
+                    cell = self.crafting_grid[r][c]
+                    if cell:
+                        cell.quantity -= 1
+                        if cell.quantity <= 0:
+                            self.crafting_grid[r][c] = None
+        # Resultado y cantidad
+        recipe = self.recipes[recipe_name]
+        result_name = recipe['result']
+        result_qty = recipe.get('result_qty', 1)
+        # Intentar añadir al inventario la cantidad completa
+        if not self.add_item(result_name, result_qty):
+            # si no hay espacio, dejar como dragged_item con la cantidad
+            self.dragged_item = InventoryItems(result_name, self.item_images.get(result_name, ""), result_qty)
+            print(f"[attempt_craft] crafted {result_name} x{result_qty} (as dragged_item)")
+        else:
+            print(f"[attempt_craft] crafted {result_name} x{result_qty} and added to inventory")
+        self._check_recipe()
+        return result_name
+
+    def close_inventory(self):
+        if self.dragged_item:
+            self._return_dragged_item()
+        # Devolver items de la grilla al inventario
+        for r in range(constants.CRAFTING_GRID_SIZE):
+            for c in range(constants.CRAFTING_GRID_SIZE):
+                cell = self.crafting_grid[r][c]
+                if cell:
+                    self.add_item(cell.name, cell.quantity)
+                    self.crafting_grid[r][c] = None
+        self._check_recipe()
+
+    # -----------------------
+    # Utilidades
+    # -----------------------
+    def has_axe_equipped(self):
+        return ((self.left_hand  and self.left_hand.name  == 'axe') or
+                (self.right_hand and self.right_hand.name == 'axe'))
+
+    def has_hoe_equipped(self):
+        return ((self.left_hand  and self.left_hand.name  == 'hoe') or
+                (self.right_hand and self.right_hand.name == 'hoe'))
+
+# ===== FILE: main.py =====
+
+import pygame
+import sys
+import constants
+from character import Character
+from world import World
+
+pygame.init()
+screen = pygame.display.set_mode((constants.WIDTH, constants.HEIGHT))
+pygame.display.set_caption("Survival Game")
+
+
+def main():
+    clock = pygame.time.Clock()
+    font  = pygame.font.SysFont(None, 19)
+
+    world     = World(constants.WIDTH, constants.HEIGHT)
+    character = Character(constants.WIDTH // 2, constants.HEIGHT // 2)
+    character._world = world
+
+    # Debug: dar semillas al inicio para probar
+    character.inventory.add_item(constants.ITEM_CARROT_SEED, 24)
+
+    show_inventory   = False
+    show_coordinates = False
+    status_update_time = 0
+
+    camera_x = character.x - constants.WIDTH  // 2
+    camera_y = character.y - constants.HEIGHT // 2
+
+    while True:
+        dt = clock.tick(60)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE:
+                    character.interact(world)
+
+                if event.key == pygame.K_e:
+                    character.drink_water(world)
+
+                if event.key == pygame.K_r:
+                    world     = World(constants.WIDTH, constants.HEIGHT)
+                    character = Character(constants.WIDTH // 2, constants.HEIGHT // 2)
+                    character._world = world
+                    character.inventory.add_item(constants.ITEM_CARROT_SEED, 24)
+
+                if event.key == pygame.K_i:
+                    if show_inventory:
+                        character.inventory.close_inventory()
+                    show_inventory = not show_inventory
+
+                if event.key == pygame.K_f:
+                    character.update_food(20)
+                if event.key == pygame.K_t:
+                    character.update_thirst(20)
+                if event.key == pygame.K_c:
+                    show_coordinates = not show_coordinates
+
+                if event.key == pygame.K_z and show_inventory:
+                    result = character.inventory.attempt_craft()
+                    print(f"[craft] {result}" if result else "[craft] sin receta")
+
+                if event.key == pygame.K_h:
+                    if character.inventory.has_axe_equipped():
+                        character.start_chop(world)
+                    else:
+                        print("No tenés hacha equipada.")
+
+                if event.key == pygame.K_p:
+                    if character.inventory.has_hoe_equipped():
+                        character.start_hoe(world)
+                    else:
+                        print("No tenés pala equipada.")
+
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                character.inventory.handle_click(event.pos, event.button, show_inventory)
+
+        # ── Movimiento ────────────────────────────────────────────────────────
+        dx = dy = 0
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_LEFT]:  dx = -5
+        if keys[pygame.K_RIGHT]: dx =  5
+        if keys[pygame.K_UP]:    dy = -5
+        if keys[pygame.K_DOWN]:  dy =  5
+
+        character.is_running = keys[pygame.K_LSHIFT] and character.stamina > 0
+        character.move(dx, dy, world)
+        character.update_animation(dt)
+        character._world = world
+
+        # Preview del farmland: actualizar cada frame según si P está apretada
+        character.update_hoe_preview(keys[pygame.K_p])
+
+        # ── Auto siembra/cosecha al pararse encima del farmland ───────────────
+        character.auto_farm_interact(world)
+
+        camera_x = character.x - constants.WIDTH  // 2
+        camera_y = character.y - constants.HEIGHT // 2
+
+        world.update_chunks(character.x, character.y)
+        world.update_time(dt)
+        world.update_water(dt)
+        world.update_farms(dt)   # riego automático + crecimiento
+
+        # ── Estado del personaje ──────────────────────────────────────────────
+        status_update_time += dt
+        if status_update_time >= constants.STATUS_UPDATE_INTERVAL:
+            character.update_status(world)
+            status_update_time = 0
+            if character.energy <= 0 or character.food <= 0 or character.thirst <= 0:
+                df  = pygame.font.SysFont(None, 72)
+                txt = df.render("¡Has muerto!", True, (255,0,0))
+                screen.blit(txt, (constants.WIDTH//2 - txt.get_width()//2,
+                                  constants.HEIGHT//2 - txt.get_height()//2))
+                pygame.display.flip()
+                pygame.time.delay(3000)
+                pygame.quit(); sys.exit()
+
+        # ── Render ────────────────────────────────────────────────────────────
+        screen.fill((0,0,0))
+        world.draw(screen, camera_x, camera_y)
+
+        # Dibujar preview del farmland (tile fantasma semitransparente)
+        if character.hoe_preview_tile:
+            px, py = character.hoe_preview_tile
+            sx = px - camera_x
+            sy = py - camera_y
+            ts = constants.GRASS_SIZE
+            # Fondo marrón semitransparente
+            preview_surf = pygame.Surface((ts, ts), pygame.SRCALPHA)
+            preview_surf.fill((120, 80, 40, 140))
+            screen.blit(preview_surf, (sx, sy))
+            # Borde punteado blanco
+            pygame.draw.rect(screen, (255, 255, 200), (sx, sy, ts, ts), 2)
+            # Texto "P: confirmar"
+            ptxt = font.render("P", True, (255, 255, 180))
+            screen.blit(ptxt, (sx + ts//2 - ptxt.get_width()//2,
+                               sy + ts//2 - ptxt.get_height()//2))
+
+        character.draw(screen, camera_x, camera_y, world)
+        character.draw_inventory(screen, show_inventory)
+
+        if show_coordinates:
+            ct = font.render(f"X:{int(character.x)}  Y:{int(character.y)}", True, constants.WHITE)
+            screen.blit(ct, (10, constants.HEIGHT - 60))
+
+        # ── HUD contextual ────────────────────────────────────────────────────
+        if show_inventory:
+            hint = font.render(
+                "Crafteo: arrastrá → clic Result  |  Z: craftear directo  |  I: cerrar",
+                True, (220,220,100))
+            screen.blit(hint, (constants.WIDTH//2 - hint.get_width()//2,
+                               constants.HEIGHT - 50))
+        else:
+            # Mostrar semillas disponibles
+            seeds = character.inventory.get_quantity(constants.ITEM_CARROT_SEED)
+            carrots = character.inventory.get_quantity(constants.ITEM_CARROT)
+            info = font.render(
+                f"🌱 Semillas: {seeds}   🥕 Zanahorias: {carrots}",
+                True, (180,230,120))
+            screen.blit(info, (constants.WIDTH//2 - info.get_width()//2, 8))
+
+            # Indicador de farmland bajo el jugador
+            cx = character.x + character.width  // 2
+            cy = character.y + character.height // 2
+            farm = world.get_farmland_at(cx, cy)
+            if farm:
+                manual_t = getattr(farm, '_manual_water_timer', 0)
+                adj_water = world.water_adjacent(farm.x, farm.y)
+                water_src = "💧 agua adyacente" if adj_water else (f"🪣 regado ({manual_t//1000}s)" if manual_t>0 else "🏜 sin agua — E para regar")
+                remaining = farm.seeds_count if farm.state == "ready" else ""
+                state_msgs = {
+                    "empty":     "Vacío — caminá encima para sembrar",
+                    "planted":   f"Sembrado — {water_src}",
+                    "growing":   f"Fase {farm.phase}/4 — {water_src}",
+                    "ready":     f"¡Listo para cosechar! ({farm.seeds_count} restantes) — caminá encima",
+                    "harvested": "Cosechado — regenerando...",
+                }
+                msg = state_msgs.get(farm.state, "")
+                stxt = font.render(msg, True, (255,255,140))
+                screen.blit(stxt, (constants.WIDTH//2 - stxt.get_width()//2,
+                                   constants.HEIGHT - 55))
+
+            controls = [
+                "P:preparar tierra  ESPACIO:recolectar  H:hacha  E:beber/regar",
+                "I:inventario  C:coords  F:+comida  T:+agua  R:reiniciar",
+            ]
+            for i, line in enumerate(controls):
+                ct = font.render(line, True, (160,160,160))
+                screen.blit(ct, (constants.WIDTH - ct.get_width() - 8,
+                                 constants.HEIGHT - 36 + i*18))
+
+        pygame.display.flip()
+
+
+if __name__ == "__main__":
+    main()
+
+# ===== FILE: world.py =====
+
+"""
+world.py — Gestión de chunks, generación de objetos, agua y agricultura.
+"""
+import os
+import random
+import pygame
+import constants
+from elements import Tree, SmallStone, Farmland, Water
+
+
+class World:
+    def __init__(self, width, height, start_x=0, start_y=0):
+        self.view_width  = width
+        self.view_height = height
+        self.chunk_size  = constants.CHUNK_SIZE
+        self.active_chunks   = {}
+        self.inactive_chunks = {}
+        self.current_time    = constants.MORNING_TIME
+
+        grass_path = os.path.join('assets','images','objects','grass.png')
+        try:
+            img = pygame.image.load(grass_path).convert_alpha()
+            self.grass_image = pygame.transform.scale(
+                img, (constants.GRASS_SIZE, constants.GRASS_SIZE))
+        except Exception:
+            self.grass_image = pygame.Surface(
+                (constants.GRASS_SIZE, constants.GRASS_SIZE), pygame.SRCALPHA)
+            self.grass_image.fill((34,139,34))
+
+        self.day_overlay = pygame.Surface((width, height), pygame.SRCALPHA)
+
+        sc = self.get_chunk_coords(start_x, start_y)
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                self.generate_chunk(sc[0]+dx, sc[1]+dy)
+
+    # ── Tiempo ────────────────────────────────────────────────────────────────
+    def update_time(self, dt):
+        self.current_time = (self.current_time + dt) % constants.DAY_LENGTH
+
+    # ── Chunks ────────────────────────────────────────────────────────────────
+    def get_chunk_coords(self, x, y):
+        return (int(x) // self.chunk_size, int(y) // self.chunk_size)
+
+    def generate_chunk(self, cx, cy):
+        key = (cx, cy)
+        if key in self.active_chunks:
+            return self.active_chunks[key]
+        if key in self.inactive_chunks:
+            chunk = self.inactive_chunks.pop(key)
+            self.active_chunks[key] = chunk
+            return chunk
+        chunk = Chunk(cx, cy)
+        self.active_chunks[key] = chunk
+        return chunk
+
+    def update_chunks(self, px, py, radius=2):
+        pc = self.get_chunk_coords(px, py)
+        needed = {(pc[0]+dx, pc[1]+dy)
+                  for dx in range(-radius, radius+1)
+                  for dy in range(-radius, radius+1)}
+        for c in needed:
+            if c not in self.active_chunks:
+                self.generate_chunk(*c)
+        for c in [k for k in list(self.active_chunks) if k not in needed]:
+            self.inactive_chunks[c] = self.active_chunks.pop(c)
+
+    # ── Agua ──────────────────────────────────────────────────────────────────
+    def update_water(self, dt):
+        for chunk in self.active_chunks.values():
+            for w in chunk.water_tiles.values():
+                w.update(dt)
+
+    def is_water_at(self, x, y) -> bool:
+        tx = (int(x) // constants.GRASS_SIZE) * constants.GRASS_SIZE
+        ty = (int(y) // constants.GRASS_SIZE) * constants.GRASS_SIZE
+        coords = self.get_chunk_coords(tx, ty)
+        chunk  = self.active_chunks.get(coords)
+        return chunk is not None and (tx, ty) in chunk.water_tiles
+
+    def water_adjacent(self, tile_x, tile_y) -> bool:
+        """
+        True si alguno de los 4 tiles directamente adyacentes al farmland es agua.
+        tile_x, tile_y: coordenadas ya alineadas a la grilla (múltiplos de GRASS_SIZE).
+        """
+        step = constants.GRASS_SIZE
+        for dx, dy in ((step,0),(-step,0),(0,step),(0,-step)):
+            if self.is_water_at(tile_x + dx, tile_y + dy):
+                return True
+        return False
+
+    def water_nearby(self, x, y, radius=None) -> bool:
+        """Mantener por compatibilidad — usa adjacency."""
+        tx = (int(x) // constants.GRASS_SIZE) * constants.GRASS_SIZE
+        ty = (int(y) // constants.GRASS_SIZE) * constants.GRASS_SIZE
+        return self.water_adjacent(tx, ty)
+
+    # ── Agricultura ───────────────────────────────────────────────────────────
+    def update_farms(self, dt):
+        """
+        Actualiza todos los farmlands.
+        Regado = tile adyacente a agua O jugador lo regó manualmente (fl.is_watered_by_player).
+        """
+        for chunk in self.active_chunks.values():
+            for fl in chunk.farmlands:
+                adj_water = self.water_adjacent(fl.x, fl.y)
+                # is_watered_by_player se setea en character.water_farmland()
+                # y dura FARM_MANUAL_WATER_DURATION ms
+                manual = getattr(fl, '_manual_water_timer', 0) > 0
+                if manual:
+                    fl._manual_water_timer = max(0, fl._manual_water_timer - dt)
+                has_water = adj_water or manual
+                fl.update(dt, has_water)
+
+    def add_farmland(self, x, y) -> bool:
+        """Crea un tile de farmland en la posición alineada a la grilla."""
+        tx = (int(x) // constants.GRASS_SIZE) * constants.GRASS_SIZE
+        ty = (int(y) // constants.GRASS_SIZE) * constants.GRASS_SIZE
+        coords = self.get_chunk_coords(tx, ty)
+        if coords not in self.active_chunks:
+            self.generate_chunk(*coords)
+        chunk = self.active_chunks[coords]
+        key   = (tx, ty)
+        # No crear sobre agua
+        if key in chunk.water_tiles:
+            return False
+        for f in chunk.farmlands:
+            if f.x == tx and f.y == ty:
+                return False   # ya existe
+        chunk.farmlands.append(Farmland(tx, ty))
+        return True
+
+    def get_farmland_at(self, x, y):
+        """Devuelve el Farmland en la posición (x,y) o None."""
+        tx = (int(x) // constants.GRASS_SIZE) * constants.GRASS_SIZE
+        ty = (int(y) // constants.GRASS_SIZE) * constants.GRASS_SIZE
+        coords = self.get_chunk_coords(tx, ty)
+        chunk  = self.active_chunks.get(coords)
+        if chunk is None:
+            return None
+        for f in chunk.farmlands:
+            if f.x == tx and f.y == ty:
+                return f
+        return None
+
+    # ── Dibujado ──────────────────────────────────────────────────────────────
+    def draw(self, screen, camera_x, camera_y):
+        # 1. Pasto continuo cubriendo toda la pantalla
+        tile   = constants.GRASS_SIZE
+        cam_ix = int(camera_x)
+        cam_iy = int(camera_y)
+        for tx in range(cam_ix // tile, (cam_ix + constants.WIDTH)  // tile + 2):
+            for ty in range(cam_iy // tile, (cam_iy + constants.HEIGHT) // tile + 2):
+                screen.blit(self.grass_image, (tx*tile - cam_ix - 1, ty*tile - cam_iy - 1))
+
+        # 2. Objetos de chunks
+        for chunk in self.active_chunks.values():
+            chunk.draw(screen, camera_x, camera_y)
+
+        # 3. Overlay día/noche
+        t = self.current_time
+        if constants.MORNING_TIME <= t < constants.DUSK_TIME:
+            pass
+        elif constants.DAWN_TIME <= t < constants.MORNING_TIME:
+            prog  = (t-constants.DAWN_TIME)/(constants.MORNING_TIME-constants.DAWN_TIME)
+            alpha = int(constants.MAX_DARKNESS*(1-prog))
+            self.day_overlay.fill((*constants.DAWN_DUSK_COLOR, alpha))
+            screen.blit(self.day_overlay, (0,0))
+        elif constants.DUSK_TIME <= t < constants.MIDNIGHT_TIME:
+            prog  = (t-constants.DUSK_TIME)/(constants.MIDNIGHT_TIME-constants.DUSK_TIME)
+            alpha = int(constants.MAX_DARKNESS*prog)
+            self.day_overlay.fill((*constants.DAWN_DUSK_COLOR, alpha))
+            screen.blit(self.day_overlay, (0,0))
+        else:
+            self.day_overlay.fill((*constants.BLACK, constants.MAX_DARKNESS))
+            screen.blit(self.day_overlay, (0,0))
+
+
+class Chunk:
+    def __init__(self, chunk_x, chunk_y):
+        self.chunk_x     = chunk_x
+        self.chunk_y     = chunk_y
+        self.trees        = []
+        self.small_stones = []
+        self.farmlands    = []
+        self.water_tiles  = {}   # (wx, wy) → Water
+
+        bx  = chunk_x * constants.CHUNK_SIZE
+        by  = chunk_y * constants.CHUNK_SIZE
+        w = h = constants.CHUNK_SIZE
+        rng = random.Random(hash((chunk_x, chunk_y)))
+
+        # Agua (lago circular)
+        if rng.random() < constants.WATER_GENERATION_PROBABILITY:
+            cx = bx + rng.randint(0, w)
+            cy = by + rng.randint(0, h)
+            radius = rng.randint(3, 8) * constants.GRASS_SIZE
+            step   = constants.GRASS_SIZE
+            for yo in range(-int(radius), int(radius)+1, step):
+                for xo in range(-int(radius), int(radius)+1, step):
+                    if xo**2 + yo**2 <= radius**2:
+                        gx = ((cx+xo) // step) * step
+                        gy = ((cy+yo) // step) * step
+                        if bx <= gx < bx+w and by <= gy < by+h:
+                            self.water_tiles[(gx, gy)] = Water(gx, gy)
+
+        def _tiles_for(ox, oy, size):
+            """Devuelve todos los tiles de grilla que cubre un objeto de tamaño 'size'."""
+            step = constants.GRASS_SIZE
+            tiles = set()
+            for dx in range(0, size + step, step):
+                for dy in range(0, size + step, step):
+                    gx = ((ox + dx) // step) * step
+                    gy = ((oy + dy) // step) * step
+                    tiles.add((gx, gy))
+            return tiles
+
+        def _overlaps_water(ox, oy, size):
+            return bool(_tiles_for(ox, oy, size) & self.water_tiles.keys())
+
+        # Árboles (evitan TODOS los tiles de agua que cubrirían)
+        for _ in range(rng.randint(2, 5)):
+            for _ in range(50):
+                tx = bx + rng.randint(0, w - constants.TREE_SIZE)
+                ty = by + rng.randint(0, h - constants.TREE_SIZE)
+                if not _overlaps_water(tx, ty, constants.TREE_SIZE):
+                    self.trees.append(Tree(tx, ty))
+                    break
+
+        # Piedras (evitan TODOS los tiles de agua que cubrirían)
+        for _ in range(rng.randint(1, 3)):
+            for _ in range(50):
+                sx = bx + rng.randint(0, w - constants.SMALL_STONE_SIZE)
+                sy = by + rng.randint(0, h - constants.SMALL_STONE_SIZE)
+                if not _overlaps_water(sx, sy, constants.SMALL_STONE_SIZE):
+                    self.small_stones.append(SmallStone(sx, sy))
+                    break
+
+    def draw(self, screen, camera_x, camera_y, grass_image=None):
+        # Farmlands (reemplazan pasto)
+        for fl in self.farmlands:
+            fl.draw(screen, camera_x, camera_y)
+        # Agua
+        for w in self.water_tiles.values():
+            w.draw(screen, camera_x, camera_y)
+        # Sólidos
+        for tree in self.trees:
+            tree.draw(screen, camera_x, camera_y)
+        for stone in self.small_stones:
+            stone.draw(screen, camera_x, camera_y)

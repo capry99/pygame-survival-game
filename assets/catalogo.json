@@ -1,0 +1,26 @@
+[
+    {
+        "tipo": "elem",
+        "nombre": "Cerca",
+        "categoria": "fase_ind",
+        "archivo": "assets\\images\\cerca\\cerca_fase_ind_0.png"
+    },
+    {
+        "tipo": "elem",
+        "nombre": "Cerca",
+        "categoria": "triple_hor",
+        "archivo": "assets\\images\\cerca\\cerca_triple_hor_1.png"
+    },
+    {
+        "tipo": "elem",
+        "nombre": "Cerca",
+        "categoria": "triple_vert",
+        "archivo": "assets\\images\\cerca\\cerca_triple_vert_2.png"
+    },
+    {
+        "tipo": "elem",
+        "nombre": "Cerca",
+        "categoria": "cuadrado",
+        "archivo": "assets\\images\\cerca\\cerca_cuadrado_3.png"
+    }
+]
